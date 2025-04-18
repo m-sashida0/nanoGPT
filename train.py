@@ -15,11 +15,15 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123
 $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
+# train.py
+# This training script can be run both on a single gpu in debug mode,
+# and also in a larger training run with distributed data parallel (ddp).
 
 import os
 import time
 import math
 import pickle
+import argparse
 from contextlib import nullcontext
 
 import numpy as np
@@ -30,75 +34,126 @@ from torch.distributed import init_process_group, destroy_process_group
 from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
+# 引数パース
+parser = argparse.ArgumentParser(description="Train a GPT model with custom settings.")
 # I/O
-out_dir = 'out'
-eval_interval = 2000
-log_interval = 1
-eval_iters = 200
-eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
-# wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+parser.add_argument('--out_dir', type=str, default='out')
+parser.add_argument('--eval_interval', type=int, default=2000)
+parser.add_argument('--log_interval', type=int, default=1)
+parser.add_argument('--eval_iters', type=int, default=200)
+parser.add_argument('--eval_only', action='store_true')
+parser.add_argument('--always_save_checkpoint', action='store_true')
+parser.add_argument('--init_from', type=str, choices=['scratch','resume','gpt2','gpt2-medium','gpt2-large','gpt2-xl'], default='scratch')
+# wandb
+parser.add_argument('--wandb_log', action='store_true')
+parser.add_argument('--wandb_project', type=str, default='owt')
+parser.add_argument('--wandb_run_name', type=str, default='gpt2')
 # data
-dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+parser.add_argument('--dataset', type=str, default='openwebtext')
+parser.add_argument('--gradient_accumulation_steps', type=int, default=40)
+parser.add_argument('--batch_size', type=int, default=12)
 # model
-n_layer = 12
-n_head = 12
-n_embd = 768
-dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
-bias = False # do we use bias inside LayerNorm and Linear layers?
-# adamw optimizer
-learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
-weight_decay = 1e-1
-beta1 = 0.9
-beta2 = 0.95
-grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
-# learning rate decay settings
-decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-# DDP settings
-backend = 'nccl' # 'nccl', 'gloo', etc.
+parser.add_argument('--block_size', type=int, default=1024)
+parser.add_argument('--n_layer', type=int, default=12)
+parser.add_argument('--n_head', type=int, default=12)
+parser.add_argument('--n_embd', type=int, default=768)
+parser.add_argument('--dropout', type=float, default=0.0)
+parser.add_argument('--bias', action='store_true')
+# optimizer
+parser.add_argument('--learning_rate', type=float, default=6e-4)
+parser.add_argument('--max_iters', type=int, default=600000)
+parser.add_argument('--weight_decay', type=float, default=1e-1)
+parser.add_argument('--beta1', type=float, default=0.9)
+parser.add_argument('--beta2', type=float, default=0.95)
+parser.add_argument('--grad_clip', type=float, default=1.0)
+# lr decay
+parser.add_argument('--decay_lr', action='store_true')
+parser.add_argument('--warmup_iters', type=int, default=2000)
+parser.add_argument('--lr_decay_iters', type=int, default=600000)
+parser.add_argument('--min_lr', type=float, default=6e-5)
+# DDP
+parser.add_argument('--backend', type=str, default='nccl')
 # system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+parser.add_argument('--device', type=str, default='cuda')
+parser.add_argument('--dtype', type=str, choices=['float32','bfloat16','float16'], default=None)
+parser.add_argument('--compile', action='store_true')
+# custom mask
+parser.add_argument('--custom_radii', type=lambda s: [int(x) for x in s.split(',')], default=None,
+                    help='comma-separated list of radii per layer')
+parser.add_argument('--custom_modes', type=lambda s: s.split(','), default=None,
+                    help="comma-separated list of modes ('within' or 'beyond') per layer")
+
+args = parser.parse_args()
 # -----------------------------------------------------------------------------
+
+# I/O setup
+out_dir = args.out_dir
+eval_interval = args.eval_interval
+log_interval = args.log_interval
+eval_iters = args.eval_iters
+eval_only = args.eval_only
+always_save_checkpoint = args.always_save_checkpoint
+init_from = args.init_from
+
+# wandb
+wandb_log = args.wandb_log
+wandb_project = args.wandb_project
+wandb_run_name = args.wandb_run_name
+
+# data
+dataset = args.dataset
+gradient_accumulation_steps = args.gradient_accumulation_steps
+batch_size = args.batch_size
+block_size = args.block_size
+
+# model params
+n_layer = args.n_layer
+n_head = args.n_head
+n_embd = args.n_embd
+dropout = args.dropout
+bias = args.bias
+custom_radii = args.custom_radii
+custom_modes = args.custom_modes
+
+# optimizer params
+learning_rate = args.learning_rate
+max_iters = args.max_iters
+weight_decay = args.weight_decay
+beta1 = args.beta1
+beta2 = args.beta2
+grad_clip = args.grad_clip
+# lr decay
+decay_lr = args.decay_lr
+warmup_iters = args.warmup_iters
+lr_decay_iters = args.lr_decay_iters
+min_lr = args.min_lr
+
+# DDP/system
+backend = args.backend
+device = args.device
+if args.dtype:
+    dtype = args.dtype
+else:
+    dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+compile = args.compile
+
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
-# -----------------------------------------------------------------------------
 
-# various inits, derived attributes, I/O setup
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+# derived
+ddp = int(os.environ.get('RANK', -1)) != -1
 if ddp:
     init_process_group(backend=backend)
-    ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
     device = f'cuda:{ddp_local_rank}'
     torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-    seed_offset = ddp_rank # each process gets a different seed
-    # world_size number of processes will be training simultaneously, so we can scale
-    # down the desired gradient accumulation iterations per process proportionally
-    assert gradient_accumulation_steps % ddp_world_size == 0
-    gradient_accumulation_steps //= ddp_world_size
+    master_process = int(os.environ['RANK']) == 0
+    gradient_accumulation_steps //= int(os.environ['WORLD_SIZE'])
 else:
-    # if not ddp, we are running on a single gpu, and one process
     master_process = True
     seed_offset = 0
-    ddp_world_size = 1
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
+tokens_per_iter = gradient_accumulation_steps * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
@@ -145,7 +200,8 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, 
+                  custom_radii=custom_radii, custom_modes=custom_modes) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")

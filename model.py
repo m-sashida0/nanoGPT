@@ -10,6 +10,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+from typing import Optional, List
 
 import torch
 import torch.nn as nn
@@ -28,7 +29,7 @@ class LayerNorm(nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_id: int):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
@@ -48,6 +49,12 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+        self.layer_id = layer_id
+        if config.custom_radii is not None and config.custom_modes is not None:
+            self.custom_radius = config.custom_radii[layer_id]
+            self.custom_mode   = config.custom_modes[layer_id]  # 'within' or 'beyond'
+        else:
+            self.custom_radius = None
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -66,6 +73,17 @@ class CausalSelfAttention(nn.Module):
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+
+            if self.custom_radius is not None:
+                idx = torch.arange(T, device=x.device)
+                dist = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs()  # [T,T]
+                if self.custom_mode == 'within':
+                    cm = dist <= self.custom_radius
+                else:  # 'beyond'
+                    cm = dist > self.custom_radius
+                # (B, nh, T, T) にブロードキャスト
+                att = att.masked_fill(~cm.unsqueeze(0).unsqueeze(0), float('-inf'))
+
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -93,13 +111,12 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_id: int):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config, layer_id)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
-
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
@@ -114,6 +131,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    custom_radii: Optional[List[int]] = None
+    custom_modes: Optional[List[str]] = None  # 'within' or 'beyond'
 
 class GPT(nn.Module):
 
@@ -122,12 +141,11 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, layer_id=i) for i in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)

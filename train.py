@@ -131,15 +131,10 @@ min_lr = args.min_lr
 # DDP/system
 backend = args.backend
 device = args.device
-if args.dtype:
-    dtype = args.dtype
-else:
-    dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+dtype   = args.dtype or ('bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16')
 compile = args.compile
 
-config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read()) # overrides from command line or config file
-config = {k: globals()[k] for k in config_keys} # will be useful for logging
+config = vars(args).copy()
 
 # derived
 ddp = int(os.environ.get('RANK', -1)) != -1
@@ -211,6 +206,8 @@ if init_from == 'scratch':
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
+    flash_enabled = model.transformer.h[0].attn.flash
+    print(f"Flash Attention enabled: {flash_enabled}")
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.

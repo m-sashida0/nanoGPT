@@ -67,8 +67,28 @@ class CausalSelfAttention(nn.Module):
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            # y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            # causal mask と custom mask を合成
+            causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
+            if self.custom_radius is not None:
+                idx  = torch.arange(T, device=x.device)
+                dist = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs()
+                if self.custom_mode == 'within':
+                    cm = dist <= self.custom_radius
+                else:
+                    cm = dist > self.custom_radius
+                mask2 = cm
+                combined_mask = causal_mask & mask2
+            else:
+                combined_mask = causal_mask
+            # Flashでは attn_mask に False=keep, True=maskout を与える必要あり
+            atten_mask = combined_mask.unsqueeze(0).unsqueeze(0)
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=~atten_mask,
+                dropout_p=self.dropout if self.training else 0,is_causal=True
+                )
+
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))

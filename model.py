@@ -55,6 +55,7 @@ class CausalSelfAttention(nn.Module):
             self.custom_mode   = config.custom_modes[layer_id]  # 'within' or 'beyond'
         else:
             self.custom_radius = None
+        self.last_atten: Optional[torch.Tensor] = None # for debugging purposes
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -67,8 +68,9 @@ class CausalSelfAttention(nn.Module):
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
-            # y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-            # causal mask と custom mask を合成
+            # 1) 生スコアを計算
+            raw_scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+
             causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
             if self.custom_radius is not None:
                 idx  = torch.arange(T, device=x.device)
@@ -76,13 +78,21 @@ class CausalSelfAttention(nn.Module):
                 if self.custom_mode == 'within':
                     cm = dist <= self.custom_radius
                 else:
-                    cm = dist > self.custom_radius
+                    cm = (dist > self.custom_radius) | (dist == 0)
                 mask2 = cm
                 combined_mask = causal_mask & mask2
             else:
                 combined_mask = causal_mask
             # Flashでは attn_mask に False=keep, True=maskout を与える必要あり
             atten_mask = combined_mask.unsqueeze(0).unsqueeze(0)
+
+            raw_scores = raw_scores.masked_fill(~atten_mask, float('-inf'))
+
+            # 3) attention weight (T×T) を保存
+            attn_weights = F.softmax(raw_scores, dim=-1)
+            self.last_atten = attn_weights.detach().cpu()
+
+
             y = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=~atten_mask,
@@ -103,8 +113,8 @@ class CausalSelfAttention(nn.Module):
                     cm = dist > self.custom_radius
                 # (B, nh, T, T) にブロードキャスト
                 att = att.masked_fill(~cm.unsqueeze(0).unsqueeze(0), float('-inf'))
-
             att = F.softmax(att, dim=-1)
+            self.last_attn = att.detach().cpu()
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
